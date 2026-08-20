@@ -1,0 +1,111 @@
+# 编译可在 OpenWrt 上原生运行的 Teleport agent。
+#
+# 为什么需要这个 workflow:
+#   官方 Linux 二进制是 CGO 动态链接 glibc 的 (readelf 可见 NEEDED: libc.so.6 /
+#   libresolv / libdl / ld-linux-x86-64.so.2)，而 OpenWrt 只有 musl，且默认不装
+#   gcompat，所以官方包在 OpenWrt 上根本起不来。
+#
+# 为什么不能简单地 CGO_ENABLED=0:
+#   lib/system/signal.go 是个 cgo 文件 (内嵌 C 的 sigaction，用来修 sysvinit 把
+#   SIGINT 设成 SIG_IGN 的老问题)，而且它是该目录下**唯一**的非 Windows 文件。
+#   CGO 一关，整个 lib/system 包就"所有文件被 build 约束排除"，而 lib/service
+#   (agent 核心) 直接依赖它 —— 这条链绕不过去。
+#   所以这里保留 CGO=1，改用 musl-gcc 当 C 编译器，源码零改动。
+#
+# 目标架构:
+#   固定 amd64，因为 OpenWrt 跑在 x86_64 上。要加 aarch64 目标的话，musl-gcc 不够
+#   (它只能产 x86_64)，需要换成 zig 当交叉 C 编译器:
+#     - 下载 zig，然后 CC="zig cc -target aarch64-linux-musl"、GOARCH=arm64
+#   这条路没在这里实现，别假设它开箱可用。
+
+name: openwrt-agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: '源仓库 (要编自己打过补丁的版本就填 noir017/teleport)'
+        required: true
+        default: 'gravitational/teleport'
+      source_ref:
+        description: 'tag / branch / commit。注意: agent 版本不能超前于 auth 的大版本'
+        required: true
+        default: 'v18.10.0'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 1
+          path: src
+
+      - name: 记录来源 (便于日后复现)
+        working-directory: src
+        run: |
+          echo "repo   = ${{ inputs.source_repo }}"
+          echo "ref    = ${{ inputs.source_ref }}"
+          echo "commit = $(git rev-parse HEAD)"
+          echo "go.mod = $(grep -m1 '^go ' go.mod)"
+
+      - name: 安装 musl 工具链
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools
+          musl-gcc --version | head -1
+
+      - name: 安装 Go (版本取自 go.mod，不写死)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
+
+      - name: 构建静态 agent
+        working-directory: src
+        env:
+          CGO_ENABLED: '1'
+          GOOS: linux
+          GOARCH: amd64
+          CC: musl-gcc
+        run: |
+          go env GOOS GOARCH CGO_ENABLED CC
+          # lib/system 应当是 CgoFiles=[signal.go]；若显示 GoFiles=[] CgoFiles=[]
+          # 说明 CGO 没生效，后面必然报 "build constraints exclude all Go files"
+          go list -f 'lib/system => GoFiles={{.GoFiles}} CgoFiles={{.CgoFiles}}' ./lib/system
+          go build -v -trimpath \
+            -ldflags="-s -w -linkmode external -extldflags -static" \
+            -o "$GITHUB_WORKSPACE/teleport" ./tool/teleport
+
+      - name: 验证产物真的是静态 musl
+        run: |
+          set -x
+          file teleport
+          # 静态二进制不该有任何 NEEDED 条目
+          if readelf -d teleport 2>/dev/null | grep -q NEEDED; then
+            echo "::error::产物仍有动态依赖，OpenWrt 上会起不来"
+            readelf -d teleport | grep NEEDED
+            exit 1
+          fi
+          echo "无动态依赖 (符合预期)"
+          # runner 也是 x86_64，所以能直接跑起来验证
+          ./teleport version
+          ls -la teleport
+          sha256sum teleport | tee teleport.sha256
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: teleport-${{ inputs.source_ref }}-linux-amd64-musl-static
+          path: |
+            teleport
+            teleport.sha256
+          retention-days: 30
+          if-no-files-found: error
