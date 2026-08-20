@@ -1,0 +1,117 @@
+# 构建可在 OpenWrt (musl) 上原生运行的 Teleport agent。
+#
+# 本分支 = v18.10.0 + 隔离 glibc 版本探测的最小补丁。workflow 构建的就是它自己
+# 所在的这个 ref，不接受源仓库参数 —— 补丁和构建配置必须成对，拆开就会出错。
+#
+# ── 为什么官方二进制在 OpenWrt 上跑不起来 ──
+# 官方 Linux 包是 CGO 动态链接 glibc 的 (readelf -d 可见 NEEDED: libc.so.6 /
+# libresolv.so.2 / libdl.so.2 / ld-linux-x86-64.so.2)。OpenWrt 只有 musl
+# (/lib/ld-musl-x86_64.so.1)，默认也不装 gcompat，所以官方包直接起不来。
+#
+# ── 为什么不能简单地 CGO_ENABLED=0 ──
+# 实测 (v18.10.0, GOOS=linux GOARCH=amd64) 关掉 CGO 会打断 5 个包:
+#   lib/system                        整包被 build 约束排除 (signal.go 是唯一的
+#                                     非 Windows 文件, 且是 cgo)
+#   lib/inventory/metadata            fetchOSVersion / fetchGlibcVersion undefined
+#   session/uacc                      UtmpBackend / NewUtmpBackend undefined,
+#                                     外加 sqlite3.ErrReadonly undefined
+#                                     (来自 mattn/go-sqlite3 的非 cgo 桩)
+#   session/shell                     getLoginShell undefined
+#   lib/secretsscanner/authorizedkeys getHostUsers undefined
+# 要补 5 个包(其中一个还牵扯第三方桩实现的缺失常量), 代价远大于收益。
+#
+# ── 所以: 保留 CGO=1, 换 musl-gcc, 只隔离真正 glibc 专有的那一处 ──
+# 上面 5 个包里, 除 lib/inventory/metadata 之外用的都是 <signal.h> / <utmp.h> /
+# <pwd.h> —— musl 全都提供。唯一真正无解的是
+# lib/inventory/metadata 里的 <gnu/libc-version.h> (glibc 独有, 任何 musl
+# 工具链都变不出来)。故用 `musl` build tag 把那一个函数换成纯 Go 空实现，
+# 其余源码零改动，glibc 构建路径的行为完全不变。
+#
+# ── 目标架构 ──
+# 固定 amd64 (OpenWrt 跑在 x86_64 上)。musl-gcc 只能产 x86_64；要 aarch64/mips
+# 得把 CC 换成 zig (`zig cc -target aarch64-linux-musl`) 并改 GOARCH。
+# 那条路没在这里实现，别假设它开箱可用。
+
+name: openwrt-agent
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 记录来源
+        run: |
+          echo "ref    = ${{ github.ref }}"
+          echo "commit = $(git rev-parse HEAD)"
+          echo "go.mod = $(grep -m1 '^go ' go.mod)"
+
+      - name: 安装 musl 工具链
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools
+          musl-gcc --version | head -1
+
+      - name: 安装 Go (版本取自 go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: 确认 musl tag 选中了正确的文件变体
+        env:
+          CGO_ENABLED: '1'
+          GOOS: linux
+          GOARCH: amd64
+          CC: musl-gcc
+        run: |
+          # 期望: CgoFiles 里没有 metadata_linux_glibc.go, GoFiles 里有 _musl.go
+          go list -tags musl -f 'metadata => GoFiles={{.GoFiles}} CgoFiles={{.CgoFiles}}' ./lib/inventory/metadata
+          # lib/system 仍应是 cgo (signal.h, musl 有)
+          go list -tags musl -f 'system   => GoFiles={{.GoFiles}} CgoFiles={{.CgoFiles}}' ./lib/system
+          if go list -tags musl -f '{{.CgoFiles}}' ./lib/inventory/metadata | grep -q glibc; then
+            echo "::error::musl tag 没生效，仍在编 glibc 变体"; exit 1
+          fi
+
+      - name: 构建静态 agent
+        env:
+          CGO_ENABLED: '1'
+          GOOS: linux
+          GOARCH: amd64
+          CC: musl-gcc
+        run: |
+          go build -v -trimpath -tags musl \
+            -ldflags="-s -w -linkmode external -extldflags -static" \
+            -o teleport ./tool/teleport
+
+      - name: 验证产物真的是静态的
+        run: |
+          file teleport
+          if readelf -d teleport 2>/dev/null | grep -q NEEDED; then
+            echo "::error::产物仍有动态依赖，OpenWrt 上会起不来"
+            readelf -d teleport | grep NEEDED
+            exit 1
+          fi
+          echo "无 NEEDED 条目 (符合预期)"
+          # runner 也是 x86_64，直接跑一遍
+          ./teleport version
+          ls -la teleport
+          sha256sum teleport | tee teleport.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: teleport-v18.10.0-openwrt-amd64-musl-static
+          path: |
+            teleport
+            teleport.sha256
+          retention-days: 30
+          if-no-files-found: error

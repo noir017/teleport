@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && musl
 
 /*
  * Teleport
@@ -20,36 +20,16 @@
 
 package metadata
 
-import (
-	"fmt"
-	"strings"
-)
-
-// fetchOSVersion combines the content of '/etc/os-release' to be e.g.
-// "ubuntu 22.04".
-func (c *fetchConfig) fetchOSVersion() string {
-	// TODO(codingllama): Leverage lib/linux.ParseOSRelease here?
-	filename := "/etc/os-release"
-	out, err := c.read(filename)
-	if err != nil {
-		return ""
-	}
-
-	id := "linux"
-	versionID := "(unknown)"
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		key, value, found := strings.Cut(line, "=")
-		if !found {
-			continue
-		}
-
-		switch key {
-		case "ID":
-			id = strings.Trim(value, `"`)
-		case "VERSION_ID":
-			versionID = strings.Trim(value, `"`)
-		}
-	}
-
-	return fmt.Sprintf("%s %s", id, versionID)
+// fetchGlibcVersion returns an empty string on musl-based systems (e.g. OpenWrt,
+// Alpine).
+//
+// The upstream implementation calls gnu_get_libc_version(3) via cgo, which needs
+// <gnu/libc-version.h> -- a glibc-only header that musl does not provide, so the
+// cgo variant cannot be compiled against a musl toolchain at all.
+//
+// There is no musl equivalent worth reporting here: musl exposes no runtime
+// version query, and the field is named after glibc specifically. Reporting
+// nothing is more honest than inventing a value.
+func (c *fetchConfig) fetchGlibcVersion() string {
+	return ""
 }

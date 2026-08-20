@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && !musl
 
 /*
  * Teleport
@@ -20,36 +20,11 @@
 
 package metadata
 
-import (
-	"fmt"
-	"strings"
-)
+// #include <gnu/libc-version.h>
+import "C"
 
-// fetchOSVersion combines the content of '/etc/os-release' to be e.g.
-// "ubuntu 22.04".
-func (c *fetchConfig) fetchOSVersion() string {
-	// TODO(codingllama): Leverage lib/linux.ParseOSRelease here?
-	filename := "/etc/os-release"
-	out, err := c.read(filename)
-	if err != nil {
-		return ""
-	}
-
-	id := "linux"
-	versionID := "(unknown)"
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		key, value, found := strings.Cut(line, "=")
-		if !found {
-			continue
-		}
-
-		switch key {
-		case "ID":
-			id = strings.Trim(value, `"`)
-		case "VERSION_ID":
-			versionID = strings.Trim(value, `"`)
-		}
-	}
-
-	return fmt.Sprintf("%s %s", id, versionID)
+// fetchGlibcVersion returns the glibc version string as returned by
+// gnu_get_libc_version.
+func (c *fetchConfig) fetchGlibcVersion() string {
+	return C.GoString(C.gnu_get_libc_version())
 }
