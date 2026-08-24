@@ -1,7 +1,10 @@
 # 构建可在 OpenWrt (musl) 上原生运行的 Teleport agent。
 #
-# 本分支 = v18.10.0 + 隔离 glibc 版本探测的最小补丁。workflow 构建的就是它自己
-# 所在的这个 ref，不接受源仓库参数 —— 补丁和构建配置必须成对，拆开就会出错。
+# ── 重要: 本 workflow 不构建它自己所在的 ref ──
+# 它总是显式 checkout `build_ref`(默认 openwrt/v18.10.0 = v18.10.0 + musl 补丁)。
+# 原因: 补丁和 `-tags musl` 必须成对出现，少任何一半都会在
+# gnu/libc-version.h 处失败。之前从 master dispatch 就是这么炸的。
+# 现在无论从哪个分支触发，构建的源码都是同一个 pinned ref。
 #
 # ── 为什么官方二进制在 OpenWrt 上跑不起来 ──
 # 官方 Linux 包是 CGO 动态链接 glibc 的 (readelf -d 可见 NEEDED: libc.so.6 /
@@ -36,6 +39,11 @@ name: openwrt-agent
 
 on:
   workflow_dispatch:
+    inputs:
+      build_ref:
+        description: '要构建的 ref (必须是带 musl 补丁的分支, 否则会在 gnu/libc-version.h 失败)'
+        required: false
+        default: openwrt/v18.10.0
 
 permissions:
   contents: read
@@ -45,15 +53,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - name: 检出补丁分支 (不是触发它的那个 ref)
+        uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.build_ref }}
           fetch-depth: 1
 
       - name: 记录来源
         run: |
-          echo "ref    = ${{ github.ref }}"
-          echo "commit = $(git rev-parse HEAD)"
-          echo "go.mod = $(grep -m1 '^go ' go.mod)"
+          echo "触发 ref = ${{ github.ref }}"
+          echo "构建 ref = ${{ inputs.build_ref }}"
+          echo "commit   = $(git rev-parse HEAD)"
+          echo "go.mod   = $(grep -m1 '^go ' go.mod)"
 
       - name: 安装 musl 工具链
         run: |
@@ -67,13 +78,20 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: 确认 musl tag 选中了正确的文件变体
+      - name: 确认 musl 补丁存在且 tag 选中了正确的文件变体
         env:
           CGO_ENABLED: '1'
           GOOS: linux
           GOARCH: amd64
           CC: musl-gcc
         run: |
+          # 先确认这个 ref 真的带补丁 —— 否则后面 6 分钟的编译是白烧的
+          if [ ! -f lib/inventory/metadata/metadata_linux_musl.go ]; then
+            echo "::error::ref '${{ inputs.build_ref }}' 上没有 musl 补丁"
+            echo "::error::缺少 lib/inventory/metadata/metadata_linux_musl.go"
+            echo "::error::用带补丁的分支 (openwrt/v18.10.0)，不要用 master 的裸源码"
+            exit 1
+          fi
           # 期望: CgoFiles 里没有 metadata_linux_glibc.go, GoFiles 里有 _musl.go
           go list -tags musl -f 'metadata => GoFiles={{.GoFiles}} CgoFiles={{.CgoFiles}}' ./lib/inventory/metadata
           # lib/system 仍应是 cgo (signal.h, musl 有)
